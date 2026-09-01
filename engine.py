@@ -1,8 +1,12 @@
 """
 Clinic Assistant conversation engine (channel-agnostic).
 Feed it (chat_id, user_display_name, text) -> get back a reply string.
-All state is persisted to data/db.json so the engine can be called once
-per incoming message (works for both a live polling loop and a webhook).
+
+Storage: if a DATABASE_URL environment variable is set, all state is kept in
+that Postgres database (survives restarts/redeploys -- use this in
+production, e.g. a free Supabase project). If DATABASE_URL is not set, state
+falls back to a local data/db.json file (fine for local testing only -- most
+free hosting wipes local files on restart).
 
 This file has NO Telegram-specific code in it on purpose: the same engine
 can sit behind Telegram, WhatsApp, or a web widget later without changes.
@@ -14,6 +18,7 @@ import uuid
 from datetime import datetime, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "db.json")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 URGENT_KEYWORDS = [
     "chest pain", "can't breathe", "cant breathe", "unconscious", "severe bleeding",
@@ -36,7 +41,48 @@ def _empty_db():
     return {"patients": [], "appointments": [], "prescriptions": [], "payments": [], "sessions": {}}
 
 
+# ---- Postgres backend (used when DATABASE_URL is set) ----
+
+def _pg_connect():
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL)
+
+
+def _pg_init(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY, data JSONB NOT NULL)"
+        )
+    conn.commit()
+
+
+def _pg_save(conn, db):
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO bot_state (id, data) VALUES (1, %s) "
+            "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+            [json.dumps(db, ensure_ascii=False)],
+        )
+    conn.commit()
+
+
+# ---- Public load/save API (routes to Postgres or local JSON file) ----
+
 def load_db():
+    if DATABASE_URL:
+        conn = _pg_connect()
+        try:
+            _pg_init(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT data FROM bot_state WHERE id = 1")
+                row = cur.fetchone()
+            if row is None:
+                db = _empty_db()
+                _pg_save(conn, db)
+                return db
+            return row[0]
+        finally:
+            conn.close()
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     if not os.path.exists(DB_PATH):
         db = _empty_db()
@@ -47,6 +93,14 @@ def load_db():
 
 
 def save_db(db):
+    if DATABASE_URL:
+        conn = _pg_connect()
+        try:
+            _pg_init(conn)
+            _pg_save(conn, db)
+        finally:
+            conn.close()
+        return
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with open(DB_PATH, "w", encoding="utf-8") as f:
         json.dump(db, f, indent=2, ensure_ascii=False)
@@ -84,7 +138,7 @@ HELP_EN = (
     "/reminders - preview the reminders this booking would trigger\n"
     "/cancel - stop whatever we were doing\n\n"
     "If this is a medical emergency, please call your local emergency number or the "
-    "clinic directly - I only handle bookings and logistics, never medical advice."
+    "clinic directly -- I only handle bookings and logistics, never medical advice."
 )
 
 HELP_HI = (
@@ -95,7 +149,7 @@ HELP_HI = (
     "/pay - भुगतान लिंक पाएं (सैंडबॉक्स/टेस्ट लिंक)\n"
     "/reminders - इस बुकिंग से जुड़े रिमाइंडर देखें\n"
     "/cancel - मौजूदा प्रक्रिया रोकें\n\n"
-    "अगर यह मेडिकल इमरजेंसी है, तो कृपया तुरंत इमरजेंसी नंबर या क्लिनिक को कॉल करें - मैं सिर्फ "
+    "अगर यह मेडिकल इमरजेंसी है, तो कृपया तुरंत इमरजेंसी नंबर या क्लिनिक को कॉल करें -- मैं सिर्फ "
     "बुकिंग और लॉजिस्टिक्स संभालता हूँ, मेडिकल सलाह नहीं देता।"
 )
 
@@ -107,6 +161,7 @@ def handle_message(chat_id, user_display_name, text) -> str:
     text_stripped = (text or "").strip()
     lower = text_stripped.lower()
 
+    # ---- Urgent detection short-circuits everything except an active booking flow ----
     if detect_urgent(text_stripped) and session["state"] == "IDLE":
         appt = _latest_appointment(db, chat_id)
         alert = {
@@ -123,15 +178,16 @@ def handle_message(chat_id, user_display_name, text) -> str:
             return (
                 "⚠️ यह गंभीर लग रहा है। कृपया तुरंत 112 (इमरजेंसी) या अपने नज़दीकी अस्पताल को कॉल करें।\n"
                 f"मैंने क्लिनिक को एक तत्काल अलर्ट भेज दिया है (अलर्ट #{alert['id']})। "
-                "मैं डॉक्टर नहीं हूँ, इसलिए मैं सलाह नहीं दे सकता - कृपया अभी मदद लें।"
+                "मैं डॉक्टर नहीं हूँ, इसलिए मैं सलाह नहीं दे सकता -- कृपया अभी मदद लें।"
             )
         return (
             "⚠️ This sounds urgent. Please call your local emergency number (112 in India) or go to "
             "the nearest hospital right now.\n"
             f"I've also logged an urgent alert for the clinic (alert #{alert['id']}). "
-            "I'm not a doctor and can't advise - please get help immediately."
+            "I'm not a doctor and can't advise -- please get help immediately."
         )
 
+    # ---- Commands ----
     if lower in ("/start", "start", "hi", "hello", "hey", "namaste", "नमस्ते"):
         _reset_session(db, chat_id)
         save_db(db)
@@ -165,7 +221,7 @@ def handle_message(chat_id, user_display_name, text) -> str:
         for a in apps[-5:]:
             patient = next((p for p in db["patients"] if p["id"] == a["patient_id"]), None)
             pname = patient["name"] if patient else "?"
-            lines.append(f"#{a['id']} - {pname} - {a['preferred_time']} - {a['reason']} - status: {a['status']}")
+            lines.append(f"#{a['id']} -- {pname} -- {a['preferred_time']} -- {a['reason']} -- status: {a['status']}")
         header = "आपकी हाल की बुकिंग:\n" if hindi else "Your recent appointments:\n"
         return header + "\n".join(lines)
 
@@ -185,7 +241,7 @@ def handle_message(chat_id, user_display_name, text) -> str:
             save_db(db)
         lines = [f"- {m['name']}: {m['dose']}, for {m['duration_days']} days" for m in existing["medicines"]]
         reminders = [f"  reminder every day until day {m['duration_days']} for {m['name']}" for m in existing["medicines"]]
-        header = "📄 डिजिटल पर्ची (डेमो डेटा):\n" if hindi else "📄 Digital prescription (demo data - not a real doctor's prescription):\n"
+        header = "📄 डिजिटल पर्ची (डेमो डेटा):\n" if hindi else "📄 Digital prescription (demo data -- not a real doctor's prescription):\n"
         rem_header = "\n\nइनसे स्वतः दवा रिमाइंडर बनेंगे:\n" if hindi else "\n\nAuto-generated medicine reminders from this:\n"
         return header + "\n".join(lines) + rem_header + "\n".join(reminders)
 
@@ -204,9 +260,9 @@ def handle_message(chat_id, user_display_name, text) -> str:
             }
             db["payments"].append(existing)
             save_db(db)
-        note_hi = "\n\n(यह एक सैंडबॉक्स/डेमो लिंक है - असली भुगतान गेटवे अभी कॉन्फ़िगर नहीं है।)"
-        note_en = "\n\n(This is a sandbox/demo link - a real payment gateway isn't wired up yet.)"
-        body = f"💳 ₹{existing['amount_inr']} - {existing['link']}"
+        note_hi = "\n\n(यह एक सैंडबॉक्स/डेमो लिंक है -- असली भुगतान गेटवे अभी कॉन्फ़िगर नहीं है।)"
+        note_en = "\n\n(This is a sandbox/demo link -- a real payment gateway isn't wired up yet.)"
+        body = f"💳 ₹{existing['amount_inr']} -- {existing['link']}"
         return body + (note_hi if hindi else note_en)
 
     if lower in ("/reminders", "reminders"):
@@ -219,10 +275,11 @@ def handle_message(chat_id, user_display_name, text) -> str:
             "Same evening after the visit: follow-up check-in",
             "Daily while medicines are active: medicine reminder (see /prescription)",
         ]
-        header = "🔔 इस बुकिंग के लिए रिमाइंडर योजना (डेमो - अभी असल में शेड्यूल नहीं हो रहे):\n" if hindi else \
-                 "🔔 Reminder plan for this booking (preview - not actually scheduled yet in this demo):\n"
+        header = "🔔 इस बुकिंग के लिए रिमाइंडर योजना (डेमो -- अभी असल में शेड्यूल नहीं हो रहे):\n" if hindi else \
+                 "🔔 Reminder plan for this booking (preview -- not actually scheduled yet in this demo):\n"
         return header + "\n".join(f"- {p}" for p in plan)
 
+    # ---- Multi-step booking flow ----
     state = session["state"]
     draft = session["draft"]
 
@@ -235,7 +292,7 @@ def handle_message(chat_id, user_display_name, text) -> str:
             session["state"] = "BOOK_REASON"
             save_db(db)
             return "विज़िट की वजह क्या है? (सिर्फ बताएं, यह डॉक्टर के लिए है)" if hindi else \
-                   "What's the reason for the visit? (Just describe it - this goes to the doctor, not for diagnosis.)"
+                   "What's the reason for the visit? (Just describe it -- this goes to the doctor, not for diagnosis.)"
         return "उनका नाम क्या है?" if hindi else "What's their name?"
 
     if state == "BOOK_NAME":
@@ -283,4 +340,5 @@ def handle_message(chat_id, user_display_name, text) -> str:
         save_db(db)
         return "ठीक है, रद्द किया। फिर से /book करें।" if hindi else "Okay, cancelled. Type /book to try again."
 
+    # ---- Fallback ----
     return HELP_HI if hindi else ("I didn't quite get that. " + HELP_EN)
